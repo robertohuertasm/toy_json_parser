@@ -1,19 +1,15 @@
-use rayon::prelude::*;
-
 use crate::models::{TypeLine, TypeLineCounter, TypeLineResults};
 use crate::printer;
+use std::io::Read;
 use std::{
     borrow::Cow,
     collections::HashMap,
     fs::File,
     io::{BufRead, BufReader},
     path::PathBuf,
+    sync::mpsc::channel,
+    thread::spawn,
     time::Instant,
-};
-use std::{
-    borrow::{Borrow, BorrowMut},
-    io::Read,
-    sync::{Arc, Mutex},
 };
 
 const ERROR_TYPE: &'static str = "ERROR";
@@ -33,11 +29,9 @@ const ERROR_TYPE: &'static str = "ERROR";
 pub fn start(path: PathBuf, pretty_print: bool) {
     let init = Instant::now();
     if let Ok(f) = File::open(&path) {
-        let mut br = BufReader::new(f);
-        let results = calculate_results(&mut br);
-        // let results = calculate_results_par(f);
-        // let results = results.lock().unwrap();
-        // let results = results.borrow();
+        // let mut br = BufReader::new(f);
+        // let results = calculate_results(&mut br);
+        let results = calculate_results_par(f);
         printer::print_table(pretty_print, &results);
     } else {
         eprintln!("Error trying to open the file {:?}", path);
@@ -45,7 +39,7 @@ pub fn start(path: PathBuf, pretty_print: bool) {
     println!("Took {:?} microseconds", init.elapsed().as_micros());
 }
 
-const CHUNK_SIZE: usize = 1_000_000;
+const CHUNK_SIZE: usize = 1_000_000_000;
 
 fn find_last_newline_position(buf: &[u8]) -> usize {
     let mut i = buf.len() - 1;
@@ -58,67 +52,85 @@ fn find_last_newline_position(buf: &[u8]) -> usize {
     buf.len()
 }
 
-fn calculate_results_par(mut f: File) -> Arc<Mutex<TypeLineResults<'static>>> {
-    let results = Arc::new(Mutex::new(HashMap::new()));
-    rayon::scope(|scope| {
-        let mut buf = Vec::with_capacity(CHUNK_SIZE);
-        loop {
-            // read what we need
-            f.by_ref()
-                .take((CHUNK_SIZE - buf.len()) as u64)
-                .read_to_end(&mut buf)
-                .unwrap();
+struct IntermediateTypeLineCounter<'a> {
+    key: Cow<'a, str>,
+    counter: TypeLineCounter,
+}
 
-            // short circuit check
-            if buf.len() == 0 {
-                break;
-            }
+fn calculate_results_par(mut f: File) -> TypeLineResults<'static> {
+    let mut results = HashMap::new();
+    let mut buf = Vec::with_capacity(CHUNK_SIZE);
+    let (tx, rx) = channel();
+    let mut threads = Vec::new();
 
-            // Copy any incomplete lines to the next s.
-            let last_newline_position = find_last_newline_position(&buf);
-            let mut next_buf = Vec::with_capacity(CHUNK_SIZE);
-            next_buf.extend_from_slice(&buf[last_newline_position..]);
-            buf.truncate(last_newline_position);
+    loop {
+        // read what we need
+        f.by_ref()
+            .take((CHUNK_SIZE - buf.len()) as u64)
+            .read_to_end(&mut buf)
+            .unwrap();
 
-            // start rayon job
-            let results_clone = results.clone();
-            scope.spawn(move |_| {
-                buf[..last_newline_position]
-                    .split(|c| *c == b'\n')
-                    .enumerate()
-                    .par_bridge()
-                    .for_each(|(line_number, line)| {
-                        let num_bytes = line.len() + 1;
-                        match serde_json::from_slice::<TypeLine>(line) {
-                            Ok(typeline) => {
-                                results_clone
-                                    .lock()
-                                    .unwrap()
-                                    .borrow_mut()
-                                    .entry(Cow::Owned(typeline.linetype))
-                                    .or_insert(TypeLineCounter::default())
-                                    .add_bytes(num_bytes);
-                            }
-                            Err(e) if num_bytes != 1 => {
-                                eprintln!(
-                                    "Error found parsing line {} - bytes {}: {:?}",
-                                    line_number, num_bytes, e
-                                );
-                                results_clone
-                                    .lock()
-                                    .unwrap()
-                                    .borrow_mut()
-                                    .entry(Cow::Borrowed(ERROR_TYPE))
-                                    .or_insert(TypeLineCounter::default())
-                                    .add_bytes(num_bytes);
-                            }
-                            Err(_) => (), // end of file
-                        }
-                    });
-            });
-            buf = next_buf;
+        // short circuit check
+        if buf.len() == 0 {
+            break;
         }
-    });
+
+        // Copy any incomplete lines to the next s.
+        let last_newline_position = find_last_newline_position(&buf);
+        let mut next_buf = Vec::with_capacity(CHUNK_SIZE);
+        next_buf.extend_from_slice(&buf[last_newline_position..]);
+        buf.truncate(last_newline_position);
+
+        // start threads and capture the results
+        let thread_tx = tx.clone();
+        let thread_buf = buf;
+        let thread = spawn(move || {
+            let mut thread_results = HashMap::new();
+            thread_buf[..last_newline_position]
+                .split(|c| *c == b'\n')
+                .enumerate()
+                .into_iter()
+                .for_each(|(line_number, line)| {
+                    let num_bytes = line.len() + 1;
+                    match serde_json::from_slice::<TypeLine>(line) {
+                        Ok(typeline) => {
+                            thread_results
+                                .entry(Cow::Owned(typeline.linetype))
+                                .or_insert(TypeLineCounter::default())
+                                .add_bytes(num_bytes);
+                        }
+                        Err(e) if num_bytes != 1 => {
+                            eprintln!(
+                                "Error found parsing line {} - bytes {}: {:?}",
+                                line_number, num_bytes, e
+                            );
+                            thread_results
+                                .entry(Cow::Borrowed(ERROR_TYPE))
+                                .or_insert(TypeLineCounter::default())
+                                .add_bytes(num_bytes);
+                        }
+                        Err(_) => (), // end of file
+                    }
+                });
+            thread_tx.send(thread_results).unwrap();
+        });
+        threads.push(thread);
+        buf = next_buf;
+    }
+
+    for t in threads {
+        t.join().expect("The thread panicked");
+    }
+
+    results = rx.recv().unwrap();
+
+    //println!("{:?}", results);
+
+    // for received in rx {
+    //     println!("Got: {:?}", received);
+    // }
+
+    //println!("returning!");
     results
 }
 
