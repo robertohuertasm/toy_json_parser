@@ -1,0 +1,18 @@
+[package]
+name = "file-reader"
+version = "0.1.0"
+authors = ["Roberto Huertas <roberto.huertas@outlook.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[[bin]]
+name = "fr"
+path = "./src/cli/main.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.62"
+prettytable-rs = "0.8"
+structopt = "0.3.21"
+rayon = "1.5.0"

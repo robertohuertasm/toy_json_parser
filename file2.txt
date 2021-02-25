@@ -1,0 +1,4 @@
+{"type":"B","foo":"bar","items":["one","two"]}
+{"type": "A","foo": 4.0 }
+{"type": "B","bar": "abcd"}
+{"type":"B","foo":"bar","items":["one","two"]}
