@@ -1,5 +1,3 @@
-use rayon::prelude::*;
-
 use crate::models::{TypeLine, TypeLineCounter, TypeLineResults};
 use crate::printer;
 use std::{
@@ -10,116 +8,19 @@ use std::{
     path::PathBuf,
     time::Instant,
 };
-use std::{
-    borrow::{Borrow, BorrowMut},
-    io::Read,
-    sync::{Arc, Mutex},
-};
 
 const ERROR_TYPE: &'static str = "ERROR";
-
-// TYPE: A | TOTAL COUNT: 98514 | TOTAL BYTES: 4630158
-// TYPE: B | TOTAL COUNT: 7488 | TOTAL BYTES: 357084
-// TYPE: C | TOTAL COUNT: 68796 | TOTAL BYTES: 3233412
-// TYPE: D | TOTAL COUNT: 163800 | TOTAL BYTES: 7698600
-// Took 1358168 microseconds
-
-// TYPE: A | TOTAL COUNT: 98514 | TOTAL BYTES: 4630158
-// TYPE: B | TOTAL COUNT: 7488 | TOTAL BYTES: 357084
-// TYPE: C | TOTAL COUNT: 68796 | TOTAL BYTES: 3233412
-// TYPE: D | TOTAL COUNT: 163800 | TOTAL BYTES: 7698600
-// Took 1421491 microseconds
 
 pub fn start(path: PathBuf, pretty_print: bool) {
     let init = Instant::now();
     if let Ok(f) = File::open(&path) {
         let mut br = BufReader::new(f);
         let results = calculate_results(&mut br);
-        // let results = calculate_results_par(f);
-        // let results = results.lock().unwrap();
-        // let results = results.borrow();
         printer::print_table(pretty_print, &results);
     } else {
         eprintln!("Error trying to open the file {:?}", path);
     }
     println!("Took {:?} microseconds", init.elapsed().as_micros());
-}
-
-const CHUNK_SIZE: usize = 1_000_000;
-
-fn find_last_newline_position(buf: &[u8]) -> usize {
-    let mut i = buf.len() - 1;
-    while i > 0 {
-        if buf[i] == b'\n' {
-            return i + 1;
-        }
-        i -= 1;
-    }
-    buf.len()
-}
-
-fn calculate_results_par(mut f: File) -> Arc<Mutex<TypeLineResults<'static>>> {
-    let results = Arc::new(Mutex::new(HashMap::new()));
-    rayon::scope(|scope| {
-        let mut buf = Vec::with_capacity(CHUNK_SIZE);
-        loop {
-            // read what we need
-            f.by_ref()
-                .take((CHUNK_SIZE - buf.len()) as u64)
-                .read_to_end(&mut buf)
-                .unwrap();
-
-            // short circuit check
-            if buf.len() == 0 {
-                break;
-            }
-
-            // Copy any incomplete lines to the next s.
-            let last_newline_position = find_last_newline_position(&buf);
-            let mut next_buf = Vec::with_capacity(CHUNK_SIZE);
-            next_buf.extend_from_slice(&buf[last_newline_position..]);
-            buf.truncate(last_newline_position);
-
-            // start rayon job
-            let results_clone = results.clone();
-            scope.spawn(move |_| {
-                buf[..last_newline_position]
-                    .split(|c| *c == b'\n')
-                    .enumerate()
-                    .par_bridge()
-                    .for_each(|(line_number, line)| {
-                        let num_bytes = line.len() + 1;
-                        match serde_json::from_slice::<TypeLine>(line) {
-                            Ok(typeline) => {
-                                results_clone
-                                    .lock()
-                                    .unwrap()
-                                    .borrow_mut()
-                                    .entry(Cow::Owned(typeline.linetype))
-                                    .or_insert(TypeLineCounter::default())
-                                    .add_bytes(num_bytes);
-                            }
-                            Err(e) if num_bytes != 1 => {
-                                eprintln!(
-                                    "Error found parsing line {} - bytes {}: {:?}",
-                                    line_number, num_bytes, e
-                                );
-                                results_clone
-                                    .lock()
-                                    .unwrap()
-                                    .borrow_mut()
-                                    .entry(Cow::Borrowed(ERROR_TYPE))
-                                    .or_insert(TypeLineCounter::default())
-                                    .add_bytes(num_bytes);
-                            }
-                            Err(_) => (), // end of file
-                        }
-                    });
-            });
-            buf = next_buf;
-        }
-    });
-    results
 }
 
 /// NOTE: I chose to use a BufRead impl because I didn't want to have all the file in memory.
@@ -158,7 +59,7 @@ fn calculate_results(buffer_reader: &mut impl BufRead) -> TypeLineResults {
                     .or_insert(TypeLineCounter::default())
                     .add_bytes(num_bytes);
             }
-            Err(_) => (),
+            Err(_) => (), // eof
         }
         // clear buffer and update line number (used in case of error)
         buf.clear();
