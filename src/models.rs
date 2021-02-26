@@ -21,3 +21,9 @@ impl TypeLineCounter {
         self.bytes += bytes;
     }
 }
+
+#[derive(Debug)]
+pub struct IntermediateTypeLineCounter<'a> {
+    pub key: Cow<'a, str>,
+    pub bytes: usize,
+}
