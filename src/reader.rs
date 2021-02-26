@@ -70,7 +70,7 @@ fn calculate_results(
             break;
         }
 
-        // Copy any incomplete lines to the next s.
+        // copy incomplete lines to the next buffer.
         if let Some(last_newline_position) = find_last_newline_position(&buf) {
             let mut next_buf = Vec::with_capacity(chunk_size);
             next_buf.extend_from_slice(&buf[last_newline_position..]);
@@ -162,8 +162,8 @@ fn calculate_results(
     results
 }
 
-/// NOTE: I chose to use a BufRead impl because I didn't want to have all the file in memory.
-/// I chose the impl to allow me to pass a &[u8] from the tests while avoiding dynamic dispatching.
+// NOTE: I chose to use a BufRead impl because I didn't want to have all the file in memory.
+// I chose the impl to allow me to pass a &[u8] from the tests while avoiding dynamic dispatching.
 fn calculate_results_naive(
     buffer_reader: &mut impl BufRead,
     verbose_errors: bool,
@@ -176,7 +176,7 @@ fn calculate_results_naive(
         // using read_line instead of the lines iterator as this is slighly faster
         // it also includes the end line char and computes the number of bytes
         // I decided to panic in case there were issues with the encoding.
-        // NOTE: I tried paralellizing the reading of the lines by using Rayon `par_bridge`
+        // NOTE: I tried parallelizing the reading of the lines by using Rayon `par_bridge`
         // over the `lines` iterator but it was significantly slower.
         // Probably due to the mutex penalty I was unable to overcome.
         // I also tried to read the file by chunks and do the parsing in several rayon
