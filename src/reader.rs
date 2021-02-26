@@ -31,7 +31,7 @@ pub fn start(path: PathBuf, pretty_print: bool) {
     if let Ok(f) = File::open(&path) {
         // let mut br = BufReader::new(f);
         // let results = calculate_results(&mut br);
-        let results = calculate_results_par(f);
+        let results = calculate_results(f);
         printer::print_table(pretty_print, &results);
     } else {
         eprintln!("Error trying to open the file {:?}", path);
@@ -39,30 +39,31 @@ pub fn start(path: PathBuf, pretty_print: bool) {
     println!("Took {:?} microseconds", init.elapsed().as_micros());
 }
 
-const CHUNK_SIZE: usize = 1_000_000_000;
+const CHUNK_SIZE: usize = 70; // MAKE THIS CONFIGURABLE
 
-fn find_last_newline_position(buf: &[u8]) -> usize {
+fn find_last_newline_position(buf: &[u8]) -> Option<usize> {
     let mut i = buf.len() - 1;
     while i > 0 {
         if buf[i] == b'\n' {
-            return i + 1;
+            return Some(i + 1);
         }
         i -= 1;
     }
-    buf.len()
+    // buf.len()
+    None
 }
 
 struct IntermediateTypeLineCounter<'a> {
-    key: Cow<'a, str>,
-    counter: TypeLineCounter,
+    pub key: Cow<'a, str>,
+    pub bytes: usize,
 }
 
-fn calculate_results_par(mut f: File) -> TypeLineResults<'static> {
+fn calculate_results(mut f: impl Read) -> TypeLineResults<'static> {
     let mut results = HashMap::new();
     let mut buf = Vec::with_capacity(CHUNK_SIZE);
     let (tx, rx) = channel();
     let mut threads = Vec::new();
-
+    let mut ti = 0;
     loop {
         // read what we need
         f.by_ref()
@@ -76,67 +77,93 @@ fn calculate_results_par(mut f: File) -> TypeLineResults<'static> {
         }
 
         // Copy any incomplete lines to the next s.
-        let last_newline_position = find_last_newline_position(&buf);
-        let mut next_buf = Vec::with_capacity(CHUNK_SIZE);
-        next_buf.extend_from_slice(&buf[last_newline_position..]);
-        buf.truncate(last_newline_position);
+        if let Some(last_newline_position) = find_last_newline_position(&buf) {
+            println!("Last line position: {}", last_newline_position);
+            let mut next_buf = Vec::with_capacity(CHUNK_SIZE);
+            next_buf.extend_from_slice(&buf[last_newline_position..]);
+            buf.truncate(last_newline_position);
 
-        // start threads and capture the results
-        let thread_tx = tx.clone();
-        let thread_buf = buf;
-        let thread = spawn(move || {
-            let mut thread_results = HashMap::new();
-            thread_buf[..last_newline_position]
-                .split(|c| *c == b'\n')
-                .enumerate()
-                .into_iter()
-                .for_each(|(line_number, line)| {
-                    let num_bytes = line.len() + 1;
-                    match serde_json::from_slice::<TypeLine>(line) {
-                        Ok(typeline) => {
-                            thread_results
-                                .entry(Cow::Owned(typeline.linetype))
-                                .or_insert(TypeLineCounter::default())
-                                .add_bytes(num_bytes);
+            // start threads and capture the results
+            let thread_tx = tx.clone();
+            let thread_buf = buf;
+            let thread = spawn(move || {
+                let mut intermediate_counters = Vec::new();
+                println!(
+                    "CHUNK ({}): {:?}",
+                    ti,
+                    String::from_utf8(thread_buf[..last_newline_position].to_vec())
+                );
+                thread_buf[..last_newline_position]
+                    .split(|c| *c == b'\n')
+                    .into_iter()
+                    .for_each(|line| {
+                        let num_bytes = line.len() + 1; // adding the end line char
+                        println!("LINE ({}): {:?}", ti, String::from_utf8(line.to_vec()));
+                        match serde_json::from_slice::<TypeLine>(line) {
+                            Ok(typeline) => {
+                                intermediate_counters.push(IntermediateTypeLineCounter {
+                                    key: Cow::Owned(typeline.linetype),
+                                    bytes: num_bytes,
+                                });
+                            }
+                            Err(e) => {
+                                eprintln!("Error found parsing line bytes {}: {:?}", num_bytes, e);
+
+                                intermediate_counters.push(IntermediateTypeLineCounter {
+                                    key: Cow::Borrowed(ERROR_TYPE),
+                                    bytes: num_bytes,
+                                });
+                            }
                         }
-                        Err(e) if num_bytes != 1 => {
-                            eprintln!(
-                                "Error found parsing line {} - bytes {}: {:?}",
-                                line_number, num_bytes, e
-                            );
-                            thread_results
-                                .entry(Cow::Borrowed(ERROR_TYPE))
-                                .or_insert(TypeLineCounter::default())
-                                .add_bytes(num_bytes);
-                        }
-                        Err(_) => (), // end of file
-                    }
-                });
-            thread_tx.send(thread_results).unwrap();
-        });
-        threads.push(thread);
-        buf = next_buf;
+                    });
+                thread_tx.send(intermediate_counters).unwrap();
+            });
+            threads.push(thread);
+            buf = next_buf;
+            ti += 1;
+        } else {
+            eprintln!("The chunk size is smaller than the lines you want to parse. Increase the chunk size.");
+            break;
+        }
     }
+
+    let threads_len = threads.len();
 
     for t in threads {
         t.join().expect("The thread panicked");
     }
 
-    results = rx.recv().unwrap();
+    for _ in 0..threads_len {
+        match rx.recv() {
+            Ok(intermediate_counters) => {
+                for ic in intermediate_counters {
+                    results
+                        .entry(ic.key)
+                        .or_insert(TypeLineCounter::default())
+                        .add_bytes(ic.bytes);
+                }
+            }
+            Err(e) => {
+                eprintln!("Something went wrong with the file reading {:?}", e);
+            }
+        }
+    }
 
-    //println!("{:?}", results);
+    // rectify the end of line error for each thread
+    if let Some((key, mut counter)) = results.remove_entry(ERROR_TYPE) {
+        counter.bytes -= threads_len;
+        counter.count -= threads_len;
+        if counter.bytes > 0 {
+            results.insert(key, counter);
+        }
+    }
 
-    // for received in rx {
-    //     println!("Got: {:?}", received);
-    // }
-
-    //println!("returning!");
     results
 }
 
 /// NOTE: I chose to use a BufRead impl because I didn't want to have all the file in memory.
 /// I chose the impl to allow me to pass a &[u8] from the tests while avoiding dynamic dispatching.
-fn calculate_results(buffer_reader: &mut impl BufRead) -> TypeLineResults {
+fn calculate_results_(buffer_reader: &mut impl BufRead) -> TypeLineResults {
     let mut buf = String::new();
     let mut results = HashMap::new();
     let mut line_number = 1;
