@@ -1,4 +1,4 @@
-use crate::models::{TypeLine, TypeLineCounter, TypeLineResults};
+use crate::models::{IntermediateTypeLineCounter, TypeLine, TypeLineCounter, TypeLineResults};
 use crate::printer;
 use std::io::Read;
 use std::{
@@ -39,7 +39,7 @@ pub fn start(path: PathBuf, pretty_print: bool) {
     println!("Took {:?} microseconds", init.elapsed().as_micros());
 }
 
-const CHUNK_SIZE: usize = 70; // MAKE THIS CONFIGURABLE
+const CHUNK_SIZE: usize = 70; // TODO: MAKE THIS CONFIGURABLE
 
 fn find_last_newline_position(buf: &[u8]) -> Option<usize> {
     let mut i = buf.len() - 1;
@@ -49,21 +49,15 @@ fn find_last_newline_position(buf: &[u8]) -> Option<usize> {
         }
         i -= 1;
     }
-    // buf.len()
     None
-}
-
-struct IntermediateTypeLineCounter<'a> {
-    pub key: Cow<'a, str>,
-    pub bytes: usize,
 }
 
 fn calculate_results(mut f: impl Read) -> TypeLineResults<'static> {
     let mut results = HashMap::new();
     let mut buf = Vec::with_capacity(CHUNK_SIZE);
+    let mut fatal_error = None;
     let (tx, rx) = channel();
     let mut threads = Vec::new();
-    let mut ti = 0;
     loop {
         // read what we need
         f.by_ref()
@@ -78,7 +72,6 @@ fn calculate_results(mut f: impl Read) -> TypeLineResults<'static> {
 
         // Copy any incomplete lines to the next s.
         if let Some(last_newline_position) = find_last_newline_position(&buf) {
-            println!("Last line position: {}", last_newline_position);
             let mut next_buf = Vec::with_capacity(CHUNK_SIZE);
             next_buf.extend_from_slice(&buf[last_newline_position..]);
             buf.truncate(last_newline_position);
@@ -88,17 +81,11 @@ fn calculate_results(mut f: impl Read) -> TypeLineResults<'static> {
             let thread_buf = buf;
             let thread = spawn(move || {
                 let mut intermediate_counters = Vec::new();
-                println!(
-                    "CHUNK ({}): {:?}",
-                    ti,
-                    String::from_utf8(thread_buf[..last_newline_position].to_vec())
-                );
                 thread_buf[..last_newline_position]
                     .split(|c| *c == b'\n')
                     .into_iter()
                     .for_each(|line| {
                         let num_bytes = line.len() + 1; // adding the end line char
-                        println!("LINE ({}): {:?}", ti, String::from_utf8(line.to_vec()));
                         match serde_json::from_slice::<TypeLine>(line) {
                             Ok(typeline) => {
                                 intermediate_counters.push(IntermediateTypeLineCounter {
@@ -107,7 +94,8 @@ fn calculate_results(mut f: impl Read) -> TypeLineResults<'static> {
                                 });
                             }
                             Err(e) => {
-                                eprintln!("Error found parsing line bytes {}: {:?}", num_bytes, e);
+                                // TODO: LOG if verbose
+                                // eprintln!("Error found parsing line bytes {}: {:?}", num_bytes, e);
 
                                 intermediate_counters.push(IntermediateTypeLineCounter {
                                     key: Cow::Borrowed(ERROR_TYPE),
@@ -116,45 +104,52 @@ fn calculate_results(mut f: impl Read) -> TypeLineResults<'static> {
                             }
                         }
                     });
-                thread_tx.send(intermediate_counters).unwrap();
+
+                if let Err(e) = thread_tx.send(intermediate_counters) {
+                    // TODO: LOG if verbose
+                }
             });
             threads.push(thread);
             buf = next_buf;
-            ti += 1;
         } else {
-            eprintln!("The chunk size is smaller than the lines you want to parse. Increase the chunk size.");
+            fatal_error = Some(
+                r#"FATAL ERROR: Either the chunk size is smaller than the lines you want to parse or your file doesn't end with a newline char."#,
+            );
             break;
         }
     }
 
-    let threads_len = threads.len();
+    if let Some(error) = fatal_error {
+        eprintln!("{}", error);
+    } else {
+        let threads_len = threads.len();
 
-    for t in threads {
-        t.join().expect("The thread panicked");
-    }
-
-    for _ in 0..threads_len {
-        match rx.recv() {
-            Ok(intermediate_counters) => {
-                for ic in intermediate_counters {
-                    results
-                        .entry(ic.key)
-                        .or_insert(TypeLineCounter::default())
-                        .add_bytes(ic.bytes);
+        for t in threads {
+            t.join().expect("The thread panicked");
+        }
+        for _ in 0..threads_len {
+            match rx.recv() {
+                Ok(intermediate_counters) => {
+                    for ic in intermediate_counters {
+                        results
+                            .entry(ic.key)
+                            .or_insert(TypeLineCounter::default())
+                            .add_bytes(ic.bytes);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Something went wrong with the file reading {:?}", e);
                 }
             }
-            Err(e) => {
-                eprintln!("Something went wrong with the file reading {:?}", e);
-            }
         }
-    }
 
-    // rectify the end of line error for each thread
-    if let Some((key, mut counter)) = results.remove_entry(ERROR_TYPE) {
-        counter.bytes -= threads_len;
-        counter.count -= threads_len;
-        if counter.bytes > 0 {
-            results.insert(key, counter);
+        // rectify the end of line error for each thread
+        if let Some((key, mut counter)) = results.remove_entry(ERROR_TYPE) {
+            counter.bytes -= threads_len;
+            counter.count -= threads_len;
+            if counter.bytes > 0 {
+                results.insert(key, counter);
+            }
         }
     }
 
@@ -163,7 +158,7 @@ fn calculate_results(mut f: impl Read) -> TypeLineResults<'static> {
 
 /// NOTE: I chose to use a BufRead impl because I didn't want to have all the file in memory.
 /// I chose the impl to allow me to pass a &[u8] from the tests while avoiding dynamic dispatching.
-fn calculate_results_(buffer_reader: &mut impl BufRead) -> TypeLineResults {
+fn calculate_results_naive(buffer_reader: &mut impl BufRead) -> TypeLineResults {
     let mut buf = String::new();
     let mut results = HashMap::new();
     let mut line_number = 1;
@@ -215,7 +210,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn it_correctly_creates_the_sets() {
+    fn calculate_results_correctly_creates_the_sets() {
         let mut file_content = r#"{"type":"B","foo":"bar","items":["one","two"]}
 {"type":"B","foo":"bar","items":["one","two"]}
 {"type":"A","foo":"bar","items":["one","two"]}
@@ -227,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn it_adds_empty_lines_as_errors_creating_the_sets() {
+    fn calculate_results_adds_empty_lines_as_errors_creating_the_sets() {
         let mut file_content = r#"{"type":"B","foo":"bar","items":["one","two"]}
 {"type":"B","foo":"bar","items":["one","two"]}
 {"type":"A","foo":"bar","items":["one","two"]}
@@ -241,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn it_adds_bad_formatted_json_as_errors_creating_the_sets() {
+    fn calculate_results_adds_bad_formatted_json_as_errors_creating_the_sets() {
         let mut file_content = r#"{"type":"B" "foo":"bar","items":["one","two"]}
 {"type":"B","foo":"bar","items":["one","two"]}
 {"type":"A","foo":"bar","items":["one","two"]}
@@ -254,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn it_adds_json_with_no_type_as_errors_creating_the_sets() {
+    fn calculate_results_adds_json_with_no_type_as_errors_creating_the_sets() {
         let mut file_content = r#"{"type1":"B" "foo":"bar","items":["one","two"]}
 {"type":"B","foo":"bar","items":["one","two"]}
 {"type":"A","foo":"bar","items":["one","two"]}
@@ -267,9 +262,10 @@ mod tests {
     }
 
     #[test]
-    fn it_takes_into_account_spaces_when_counting_bytes() {
-        let mut file_content =
-            r#"  {  "type":"B", "foo":"bar","items":["one","two"]}  "#.as_bytes();
+    fn calculate_results_takes_into_account_spaces_when_counting_bytes() {
+        let mut file_content = r#"  {  "type":"B", "foo":"bar","items":["one","two"]}  
+"#
+        .as_bytes();
         let num_bytes = file_content.len();
         let result = calculate_results(&mut file_content);
         assert_eq!(result.len(), 1);
@@ -278,10 +274,99 @@ mod tests {
     }
 
     #[test]
-    fn it_takes_into_account_spaces_when_counting_bytes_even_when_invalid_json() {
-        let mut file_content = r#"  {  "type":"B" "foo":"bar","items":["one","two"]}  "#.as_bytes();
+    fn calculate_results_takes_into_account_spaces_when_counting_bytes_even_when_invalid_json() {
+        let mut file_content = r#"  {  "type":"B" "foo":"bar","items":["one","two"]}  
+"#
+        .as_bytes();
         let num_bytes = file_content.len();
         let result = calculate_results(&mut file_content);
+        let error = result.get(ERROR_TYPE).map(|r| r.bytes);
+        assert_eq!(result.len(), 1);
+        assert!(error.is_some());
+        assert_eq!(error, Some(num_bytes));
+    }
+
+    #[test]
+    fn calculate_results_does_not_work_when_file_does_not_end_with_newline() {
+        let mut file_content = r#"{ "type":"B", "foo":"bar","items":["one","two"]}"#.as_bytes();
+        let result = calculate_results(&mut file_content);
+        assert_eq!(result.len(), 0);
+    }
+
+    // -- naive
+
+    #[test]
+    fn calculate_results_naive_correctly_creates_the_sets() {
+        let mut file_content = r#"{"type":"B","foo":"bar","items":["one","two"]}
+{"type":"B","foo":"bar","items":["one","two"]}
+{"type":"A","foo":"bar","items":["one","two"]}
+{"type":"C","foo":"bar","items":["one","two"]}
+"#
+        .as_bytes();
+        let result = calculate_results_naive(&mut file_content);
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn calculate_results_naive_adds_empty_lines_as_errors_creating_the_sets() {
+        let mut file_content = r#"{"type":"B","foo":"bar","items":["one","two"]}
+{"type":"B","foo":"bar","items":["one","two"]}
+{"type":"A","foo":"bar","items":["one","two"]}
+
+{"type":"C","foo":"bar","items":["one","two"]}
+"#
+        .as_bytes();
+        let result = calculate_results_naive(&mut file_content);
+        assert_eq!(result.len(), 4);
+        assert!(result.get(ERROR_TYPE).is_some())
+    }
+
+    #[test]
+    fn calculate_results_naive_adds_bad_formatted_json_as_errors_creating_the_sets() {
+        let mut file_content = r#"{"type":"B" "foo":"bar","items":["one","two"]}
+{"type":"B","foo":"bar","items":["one","two"]}
+{"type":"A","foo":"bar","items":["one","two"]}
+{"type":"C","foo":"bar","items":["one","two"]}
+"#
+        .as_bytes();
+        let result = calculate_results_naive(&mut file_content);
+        assert_eq!(result.len(), 4);
+        assert!(result.get(ERROR_TYPE).is_some())
+    }
+
+    #[test]
+    fn calculate_results_naive_adds_json_with_no_type_as_errors_creating_the_sets() {
+        let mut file_content = r#"{"type1":"B" "foo":"bar","items":["one","two"]}
+{"type":"B","foo":"bar","items":["one","two"]}
+{"type":"A","foo":"bar","items":["one","two"]}
+{"type":"C","foo":"bar","items":["one","two"]}
+"#
+        .as_bytes();
+        let result = calculate_results_naive(&mut file_content);
+        assert_eq!(result.len(), 4);
+        assert!(result.get(ERROR_TYPE).is_some())
+    }
+
+    #[test]
+    fn calculate_results_naive_takes_into_account_spaces_when_counting_bytes() {
+        let mut file_content = r#"  {  "type":"B", "foo":"bar","items":["one","two"]}  
+"#
+        .as_bytes();
+        let num_bytes = file_content.len();
+        let result = calculate_results_naive(&mut file_content);
+        assert_eq!(result.len(), 1);
+        assert!(result.get(ERROR_TYPE).is_none());
+        assert_eq!(result.get("B").map(|r| r.bytes), Some(num_bytes));
+    }
+
+    #[test]
+    fn calculate_results_naive_takes_into_account_spaces_when_counting_bytes_even_when_invalid_json(
+    ) {
+        let mut file_content = r#"  {  "type":"B" "foo":"bar","items":["one","two"]}  
+"#
+        .as_bytes();
+        let num_bytes = file_content.len();
+        let result = calculate_results_naive(&mut file_content);
         let error = result.get(ERROR_TYPE).map(|r| r.bytes);
         assert_eq!(result.len(), 1);
         assert!(error.is_some());

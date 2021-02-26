@@ -3,4 +3,4 @@
 
 
 {"type": "B","bar": "abcd"}
-{"type":"B","foo":"bar","items":["one","two"]}
+{"type":"B","foo":"bar","items":["one","two", "three"]}
