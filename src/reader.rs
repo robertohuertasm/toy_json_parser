@@ -14,32 +14,28 @@ use std::{
 
 const ERROR_TYPE: &'static str = "ERROR";
 
-// TYPE: A | TOTAL COUNT: 98514 | TOTAL BYTES: 4630158
-// TYPE: B | TOTAL COUNT: 7488 | TOTAL BYTES: 357084
-// TYPE: C | TOTAL COUNT: 68796 | TOTAL BYTES: 3233412
-// TYPE: D | TOTAL COUNT: 163800 | TOTAL BYTES: 7698600
-// Took 1358168 microseconds
-
-// TYPE: A | TOTAL COUNT: 98514 | TOTAL BYTES: 4630158
-// TYPE: B | TOTAL COUNT: 7488 | TOTAL BYTES: 357084
-// TYPE: C | TOTAL COUNT: 68796 | TOTAL BYTES: 3233412
-// TYPE: D | TOTAL COUNT: 163800 | TOTAL BYTES: 7698600
-// Took 1421491 microseconds
-
-pub fn start(path: PathBuf, pretty_print: bool) {
+pub fn start(
+    path: PathBuf,
+    pretty_print: bool,
+    use_chunks: bool,
+    chunk_size: usize,
+    verbose_errors: bool,
+) {
     let init = Instant::now();
     if let Ok(f) = File::open(&path) {
-        // let mut br = BufReader::new(f);
-        // let results = calculate_results(&mut br);
-        let results = calculate_results(f);
-        printer::print_table(pretty_print, &results);
+        if use_chunks {
+            let results = calculate_results(f, chunk_size, verbose_errors);
+            printer::print_table(pretty_print, &results);
+        } else {
+            let mut br = BufReader::new(f);
+            let results = calculate_results_naive(&mut br, verbose_errors);
+            printer::print_table(pretty_print, &results);
+        };
     } else {
         eprintln!("Error trying to open the file {:?}", path);
     }
     println!("Took {:?} microseconds", init.elapsed().as_micros());
 }
-
-const CHUNK_SIZE: usize = 70; // TODO: MAKE THIS CONFIGURABLE
 
 fn find_last_newline_position(buf: &[u8]) -> Option<usize> {
     let mut i = buf.len() - 1;
@@ -52,16 +48,20 @@ fn find_last_newline_position(buf: &[u8]) -> Option<usize> {
     None
 }
 
-fn calculate_results(mut f: impl Read) -> TypeLineResults<'static> {
+fn calculate_results(
+    mut f: impl Read,
+    chunk_size: usize,
+    verbose_errors: bool,
+) -> TypeLineResults<'static> {
     let mut results = HashMap::new();
-    let mut buf = Vec::with_capacity(CHUNK_SIZE);
+    let mut buf = Vec::with_capacity(chunk_size);
     let mut fatal_error = None;
     let (tx, rx) = channel();
     let mut threads = Vec::new();
     loop {
         // read what we need
         f.by_ref()
-            .take((CHUNK_SIZE - buf.len()) as u64)
+            .take((chunk_size - buf.len()) as u64)
             .read_to_end(&mut buf)
             .unwrap();
 
@@ -72,7 +72,7 @@ fn calculate_results(mut f: impl Read) -> TypeLineResults<'static> {
 
         // Copy any incomplete lines to the next s.
         if let Some(last_newline_position) = find_last_newline_position(&buf) {
-            let mut next_buf = Vec::with_capacity(CHUNK_SIZE);
+            let mut next_buf = Vec::with_capacity(chunk_size);
             next_buf.extend_from_slice(&buf[last_newline_position..]);
             buf.truncate(last_newline_position);
 
@@ -94,8 +94,12 @@ fn calculate_results(mut f: impl Read) -> TypeLineResults<'static> {
                                 });
                             }
                             Err(e) => {
-                                // TODO: LOG if verbose
-                                // eprintln!("Error found parsing line bytes {}: {:?}", num_bytes, e);
+                                if verbose_errors {
+                                    eprintln!(
+                                        "Error found parsing line: {} bytes - {:?}",
+                                        num_bytes, e
+                                    );
+                                }
 
                                 intermediate_counters.push(IntermediateTypeLineCounter {
                                     key: Cow::Borrowed(ERROR_TYPE),
@@ -106,7 +110,9 @@ fn calculate_results(mut f: impl Read) -> TypeLineResults<'static> {
                     });
 
                 if let Err(e) = thread_tx.send(intermediate_counters) {
-                    // TODO: LOG if verbose
+                    if verbose_errors {
+                        eprintln!("{:?}", e);
+                    }
                 }
             });
             threads.push(thread);
@@ -158,7 +164,10 @@ fn calculate_results(mut f: impl Read) -> TypeLineResults<'static> {
 
 /// NOTE: I chose to use a BufRead impl because I didn't want to have all the file in memory.
 /// I chose the impl to allow me to pass a &[u8] from the tests while avoiding dynamic dispatching.
-fn calculate_results_naive(buffer_reader: &mut impl BufRead) -> TypeLineResults {
+fn calculate_results_naive(
+    buffer_reader: &mut impl BufRead,
+    verbose_errors: bool,
+) -> TypeLineResults {
     let mut buf = String::new();
     let mut results = HashMap::new();
     let mut line_number = 1;
@@ -186,13 +195,15 @@ fn calculate_results_naive(buffer_reader: &mut impl BufRead) -> TypeLineResults 
                     .add_bytes(num_bytes);
             }
             Err(e) if num_bytes != 0 => {
-                eprintln!("Error found parsing line {}: {:?}", line_number, e);
+                if verbose_errors {
+                    eprintln!("Error found parsing line {} - {:?}", line_number, e);
+                }
                 results
                     .entry(Cow::Borrowed(ERROR_TYPE))
                     .or_insert(TypeLineCounter::default())
                     .add_bytes(num_bytes);
             }
-            Err(_) => (),
+            Err(_) => (), // end of line
         }
         // clear buffer and update line number (used in case of error)
         buf.clear();
@@ -217,7 +228,7 @@ mod tests {
 {"type":"C","foo":"bar","items":["one","two"]}
 "#
         .as_bytes();
-        let result = calculate_results(&mut file_content);
+        let result = calculate_results(&mut file_content, 1_000, false);
         assert_eq!(result.len(), 3);
     }
 
@@ -230,7 +241,7 @@ mod tests {
 {"type":"C","foo":"bar","items":["one","two"]}
 "#
         .as_bytes();
-        let result = calculate_results(&mut file_content);
+        let result = calculate_results(&mut file_content, 1_000, false);
         assert_eq!(result.len(), 4);
         assert!(result.get(ERROR_TYPE).is_some())
     }
@@ -243,7 +254,7 @@ mod tests {
 {"type":"C","foo":"bar","items":["one","two"]}
 "#
         .as_bytes();
-        let result = calculate_results(&mut file_content);
+        let result = calculate_results(&mut file_content, 1_000, false);
         assert_eq!(result.len(), 4);
         assert!(result.get(ERROR_TYPE).is_some())
     }
@@ -256,7 +267,7 @@ mod tests {
 {"type":"C","foo":"bar","items":["one","two"]}
 "#
         .as_bytes();
-        let result = calculate_results(&mut file_content);
+        let result = calculate_results(&mut file_content, 1_000, false);
         assert_eq!(result.len(), 4);
         assert!(result.get(ERROR_TYPE).is_some())
     }
@@ -267,7 +278,7 @@ mod tests {
 "#
         .as_bytes();
         let num_bytes = file_content.len();
-        let result = calculate_results(&mut file_content);
+        let result = calculate_results(&mut file_content, 1_000, false);
         assert_eq!(result.len(), 1);
         assert!(result.get(ERROR_TYPE).is_none());
         assert_eq!(result.get("B").map(|r| r.bytes), Some(num_bytes));
@@ -279,7 +290,7 @@ mod tests {
 "#
         .as_bytes();
         let num_bytes = file_content.len();
-        let result = calculate_results(&mut file_content);
+        let result = calculate_results(&mut file_content, 1_000, false);
         let error = result.get(ERROR_TYPE).map(|r| r.bytes);
         assert_eq!(result.len(), 1);
         assert!(error.is_some());
@@ -289,7 +300,14 @@ mod tests {
     #[test]
     fn calculate_results_does_not_work_when_file_does_not_end_with_newline() {
         let mut file_content = r#"{ "type":"B", "foo":"bar","items":["one","two"]}"#.as_bytes();
-        let result = calculate_results(&mut file_content);
+        let result = calculate_results(&mut file_content, 1_000, false);
+        assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn calculate_results_does_not_work_when_the_chunks_are_smaller_than_a_line() {
+        let mut file_content = r#"{ "type":"B", "foo":"bar","items":["one","two"]}"#.as_bytes();
+        let result = calculate_results(&mut file_content, 2, false);
         assert_eq!(result.len(), 0);
     }
 
@@ -303,7 +321,7 @@ mod tests {
 {"type":"C","foo":"bar","items":["one","two"]}
 "#
         .as_bytes();
-        let result = calculate_results_naive(&mut file_content);
+        let result = calculate_results_naive(&mut file_content, false);
         assert_eq!(result.len(), 3);
     }
 
@@ -316,7 +334,7 @@ mod tests {
 {"type":"C","foo":"bar","items":["one","two"]}
 "#
         .as_bytes();
-        let result = calculate_results_naive(&mut file_content);
+        let result = calculate_results_naive(&mut file_content, false);
         assert_eq!(result.len(), 4);
         assert!(result.get(ERROR_TYPE).is_some())
     }
@@ -329,7 +347,7 @@ mod tests {
 {"type":"C","foo":"bar","items":["one","two"]}
 "#
         .as_bytes();
-        let result = calculate_results_naive(&mut file_content);
+        let result = calculate_results_naive(&mut file_content, false);
         assert_eq!(result.len(), 4);
         assert!(result.get(ERROR_TYPE).is_some())
     }
@@ -342,7 +360,7 @@ mod tests {
 {"type":"C","foo":"bar","items":["one","two"]}
 "#
         .as_bytes();
-        let result = calculate_results_naive(&mut file_content);
+        let result = calculate_results_naive(&mut file_content, false);
         assert_eq!(result.len(), 4);
         assert!(result.get(ERROR_TYPE).is_some())
     }
@@ -353,7 +371,7 @@ mod tests {
 "#
         .as_bytes();
         let num_bytes = file_content.len();
-        let result = calculate_results_naive(&mut file_content);
+        let result = calculate_results_naive(&mut file_content, false);
         assert_eq!(result.len(), 1);
         assert!(result.get(ERROR_TYPE).is_none());
         assert_eq!(result.get("B").map(|r| r.bytes), Some(num_bytes));
@@ -366,7 +384,7 @@ mod tests {
 "#
         .as_bytes();
         let num_bytes = file_content.len();
-        let result = calculate_results_naive(&mut file_content);
+        let result = calculate_results_naive(&mut file_content, false);
         let error = result.get(ERROR_TYPE).map(|r| r.bytes);
         assert_eq!(result.len(), 1);
         assert!(error.is_some());
